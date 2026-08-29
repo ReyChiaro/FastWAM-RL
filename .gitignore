@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+.venv/
+
+checkpoints/
+dataset/
+docs/
+outputs/
+
+# Some testing files for checking/demos-testing that 
+# have no use in release version, or some one-time executable scripts.
+__tests/
+
+!configs/dataset/

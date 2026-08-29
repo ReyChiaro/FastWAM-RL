@@ -1,0 +1,3 @@
+class BaseTrainer:
+
+    pass

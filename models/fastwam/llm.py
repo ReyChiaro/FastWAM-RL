@@ -279,17 +279,6 @@ class WanTextEncoder(CheckpointModule, torch.nn.Module):
 
         self.apply(init_weights)
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str | Path | None = None,
-        subfolder: str = "text_encoder",
-        **kwargs: Any,
-    ) -> "WanTextEncoder":
-        from models.fastwam.loading import construct_module
-
-        return construct_module(cls, pretrained_model_name_or_path, subfolder, kwargs)
-
     def forward(self, ids: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         x = self.token_embedding(ids)
         x = self.dropout(x)
@@ -344,22 +333,6 @@ class HuggingfaceTokenizer(CheckpointModule):
         # init tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(name, **kwargs)
         self.vocab_size = self.tokenizer.vocab_size
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str | None,
-        subfolder: str = "tokenizer",
-        **kwargs: Any,
-    ) -> "HuggingfaceTokenizer":
-        from models.fastwam.loading import resolve_model_path
-
-        model_path = resolve_model_path(pretrained_model_name_or_path)
-        nested_path = model_path / subfolder if subfolder else model_path
-        tokenizer_path = nested_path if nested_path.is_dir() else model_path
-        if not tokenizer_path.is_dir():
-            raise FileNotFoundError(f"Tokenizer directory does not exist: {tokenizer_path}")
-        return cls(name=str(tokenizer_path), **kwargs)
 
     def __call__(
         self,

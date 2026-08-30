@@ -963,17 +963,6 @@ class WanVideoVAE(CheckpointModule, nn.Module):
         self.temporal_downsample_factor = 4
         self.z_dim = z_dim
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str | Path | None = None,
-        subfolder: str = "vae",
-        **kwargs: Any,
-    ) -> "WanVideoVAE":
-        from models.fastwam.loading import construct_module
-
-        return construct_module(cls, pretrained_model_name_or_path, subfolder, kwargs)
-
     def single_encode(self, video: torch.Tensor, device: torch.device) -> torch.Tensor:
         video = video.to(device)
         x = self.model.encode(video, self.scales)

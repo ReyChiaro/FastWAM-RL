@@ -21,7 +21,7 @@ def build_collate_fn(backend_name: str) -> Callable[[list[dict[str, Any]]], dict
 class BaseDataset(ABC, Dataset):
     r"""
     Dataset operates as a storage reader from medias.
-    BaseDataset provide public shared interfaces.
+    BaseDataset provides public shared interfaces.
     """
 
     # Defines the valid keys of one dict item.

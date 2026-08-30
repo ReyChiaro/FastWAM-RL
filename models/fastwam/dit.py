@@ -345,17 +345,6 @@ class VideoDiT(CheckpointModule, nn.Module):
         self.head = Head(hidden_dim, out_dim, patch_size, eps=eps)
         self.freqs = get_freqs_cis3d_cache(head_dim, end=1024, base=10000.0)
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str | Path | None = None,
-        subfolder: str = "video_expert",
-        **kwargs,
-    ) -> "VideoDiT":
-        from models.fastwam.loading import construct_module
-
-        return construct_module(cls, pretrained_model_name_or_path, subfolder, kwargs)
-
     def build_self_attn_mask(
         self,
         video_seq_len: int,
@@ -577,17 +566,6 @@ class ActionDiT(CheckpointModule, nn.Module):
         )
         self.head = nn.Linear(hidden_dim, action_dim)
         self.freqs = get_freqs_cis1d_cache(head_dim, end=1024, base=10000.0)
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str | Path | None = None,
-        subfolder: str = "action_expert",
-        **kwargs,
-    ) -> "ActionDiT":
-        from models.fastwam.loading import construct_module
-
-        return construct_module(cls, pretrained_model_name_or_path, subfolder, kwargs)
 
     def preprocess(
         self,

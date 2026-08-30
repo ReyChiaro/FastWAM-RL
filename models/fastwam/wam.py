@@ -56,25 +56,6 @@ class ProprioEncoder(CheckpointModule, nn.Linear):
     ``proprio_encoder/``.
     """
 
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str | Path | None = None,
-        subfolder: str = "proprio_encoder",
-        **kwargs: Any,
-    ) -> "ProprioEncoder":
-        from models.fastwam.loading import component_dir, load_component_dir, resolve_model_path
-
-        module = cls(**kwargs)
-        if pretrained_model_name_or_path is None:
-            return module
-        directory = component_dir(resolve_model_path(pretrained_model_name_or_path), subfolder)
-        if directory is None:
-            raise FileNotFoundError(
-                f"No weights for component {subfolder!r} under " f"{pretrained_model_name_or_path}."
-            )
-        return load_component_dir(module, directory, strict=True)
-
 
 class FastWAM(CheckpointModule, nn.Module):
 
@@ -122,29 +103,6 @@ class FastWAM(CheckpointModule, nn.Module):
     @property
     def action_expert(self) -> ActionDiT:
         return self.mot.mixtures["action"]
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str | None = None,
-        **kwargs: Any,
-    ) -> "FastWAM":
-        """Diffusers-pipeline-style construction.
-
-        Every submodel (vae / tokenizer / text_encoder / video_expert /
-        action_expert / schedulers) arrives as an already-instantiated object,
-        each loaded by its own ``from_pretrained``.  This method assembles them
-        and loads the remaining ``proprio_encoder`` submodel from the same
-        bundle directory.
-        """
-        model = cls(**kwargs)
-        if pretrained_model_name_or_path is not None and model.proprio_encoder is not None:
-            model.proprio_encoder = ProprioEncoder.from_pretrained(
-                pretrained_model_name_or_path,
-                in_features=model.proprio_encoder.in_features,
-                out_features=model.proprio_encoder.out_features,
-            )
-        return model
 
     @property
     def current_device(self) -> torch.device:

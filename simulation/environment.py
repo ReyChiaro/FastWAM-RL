@@ -1,1 +1,8 @@
-from simulation.adapters.base import BaseAdapter
+
+from simulation.adapters.base import BaseEnvAdapter
+
+
+
+
+class SimEnvironment:
+    pass

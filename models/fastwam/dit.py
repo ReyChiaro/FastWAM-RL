@@ -8,6 +8,8 @@ from torch.utils.checkpoint import checkpoint
 from dataclasses import dataclass
 from typing import Optional, Literal
 
+from models.utils import CheckpointModule
+
 
 @dataclass
 class PreprocessOutputs:
@@ -291,7 +293,7 @@ class Head(nn.Module):
         return x
 
 
-class VideoDiT(nn.Module):
+class VideoDiT(CheckpointModule, nn.Module):
 
     def __init__(
         self,
@@ -533,7 +535,7 @@ class VideoDiT(nn.Module):
         return video_tokens
 
 
-class ActionDiT(nn.Module):
+class ActionDiT(CheckpointModule, nn.Module):
 
     def __init__(
         self,

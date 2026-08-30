@@ -1,11 +1,11 @@
-from __future__ import annotations
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from pathlib import Path
 from typing import Any, Literal, Optional
+
+from models.utils import CheckpointModule
 
 VAE_MEAN = [
     -0.2289,
@@ -384,12 +384,7 @@ class AttentionBlock(nn.Module):
         x = self.norm(x)
 
         qkv = self.to_qkv(x)
-        q, k, v = (
-            qkv.reshape(b * t, 1, c * 3, h * w)
-            .permute(0, 1, 3, 2)
-            .contiguous()
-            .chunk(3, dim=-1)
-        )
+        q, k, v = qkv.reshape(b * t, 1, c * 3, h * w).permute(0, 1, 3, 2).contiguous().chunk(3, dim=-1)
 
         x = F.scaled_dot_product_attention(q, k, v)
         x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
@@ -935,7 +930,7 @@ class VAEModel(nn.Module):
         return out
 
 
-class WanVideoVAE(nn.Module):
+class WanVideoVAE(CheckpointModule, nn.Module):
 
     def __init__(
         self,

@@ -1,3 +1,7 @@
+# Inference entrypoint
+# - standalone executable script, loading arguments from command line
+#   providing convenience for a quick demo
+
 import argparse
 
 

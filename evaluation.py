@@ -1,3 +1,6 @@
+# Evaluation entrypoint
+# - hydra-driven configurations
+
 import hydra
 from omegaconf import OmegaConf
 

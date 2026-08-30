@@ -9,6 +9,8 @@ import html
 import string
 from typing import Any, Literal, Sequence
 
+from models.utils import CheckpointModule
+
 try:
     import ftfy
 except ModuleNotFoundError:
@@ -240,7 +242,7 @@ def init_weights(module: nn.Module) -> None:
         nn.init.normal_(module.embedding.weight, std=(2 * module.num_buckets * module.num_heads) ** -0.5)
 
 
-class WanTextEncoder(torch.nn.Module):
+class WanTextEncoder(CheckpointModule, torch.nn.Module):
 
     def __init__(
         self,
@@ -325,7 +327,7 @@ def canonicalize(text: str, keep_punctuation_exact_string: str | None = None) ->
     return text.strip()
 
 
-class HuggingfaceTokenizer:
+class HuggingfaceTokenizer(CheckpointModule):
 
     def __init__(
         self,

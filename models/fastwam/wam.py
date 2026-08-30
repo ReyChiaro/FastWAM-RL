@@ -11,6 +11,7 @@ from models.fastwam.dit import VideoDiT, ActionDiT
 from models.fastwam.vae import WanVideoVAE
 from models.fastwam.llm import WanTextEncoder, HuggingfaceTokenizer
 from schedulers.flow_matching import FlowMatchingScheduler, FlowTransition
+from models.utils import CheckpointModule
 
 
 @dataclass
@@ -34,17 +35,19 @@ class ModelInputs:
 
 @dataclass
 class ConditionOutputs:
+
     embeds: torch.Tensor
     mask: torch.Tensor
 
 
 @dataclass
 class ActionCache:
+
     key_values: list[dict[str, torch.Tensor]]
     attention_mask: torch.Tensor
 
 
-class ProprioEncoder(nn.Linear):
+class ProprioEncoder(CheckpointModule, nn.Linear):
     """One linear projection of the initial proprioceptive state.
 
     Kept as its own subclass (instead of a bare ``nn.Linear``) so it can carry
@@ -65,18 +68,15 @@ class ProprioEncoder(nn.Linear):
         module = cls(**kwargs)
         if pretrained_model_name_or_path is None:
             return module
-        directory = component_dir(
-            resolve_model_path(pretrained_model_name_or_path), subfolder
-        )
+        directory = component_dir(resolve_model_path(pretrained_model_name_or_path), subfolder)
         if directory is None:
             raise FileNotFoundError(
-                f"No weights for component {subfolder!r} under "
-                f"{pretrained_model_name_or_path}."
+                f"No weights for component {subfolder!r} under " f"{pretrained_model_name_or_path}."
             )
         return load_component_dir(module, directory, strict=True)
 
 
-class FastWAM(nn.Module):
+class FastWAM(CheckpointModule, nn.Module):
 
     def __init__(
         self,

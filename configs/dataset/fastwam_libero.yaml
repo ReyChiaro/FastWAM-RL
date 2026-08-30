@@ -1,0 +1,10 @@
+_target_: data.datasets.fastwam_libero.FastWAMLiberoDataset
+root: dataset
+splits: ["libero_10", "libero_goal", "libero_object", "libero_spatial"]
+dataset_stats: dataset/dataset_stats.json
+video_size: [224, 224]
+action_horizon: 32
+video_stride: 4
+camera_keys: ["image", "wrist_image"]
+action_key: "action"
+proprio_key: "observation.state"

@@ -1,0 +1,12 @@
+defaults:
+  - dataset: fastwam_libero
+  - _self_
+
+data_module:
+  _target_: data.data_module.DataModule
+  batch_size: 4
+  num_workers: 4
+  trainsets: ["${dataset}"]
+  evalsets: null
+  train_collate_fn: null
+  eval_collate_fn: null

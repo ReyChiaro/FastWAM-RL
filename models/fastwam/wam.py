@@ -2,16 +2,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dataclasses import dataclass
-from typing import Any, Optional
 from pathlib import Path
+from dataclasses import dataclass
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from typing import Any, Optional, Self
 
 from models.fastwam.mot import FastWAMMoT, ExpertInputs
 from models.fastwam.dit import VideoDiT, ActionDiT
 from models.fastwam.vae import WanVideoVAE
-from models.fastwam.llm import WanTextEncoder, HuggingfaceTokenizer
+from models.fastwam.llm import WanTextEncoder, WantTextEncoderTokenizer
 from schedulers.flow_matching import FlowMatchingScheduler, FlowTransition
-from models.utils import CheckpointModule
 
 
 @dataclass
@@ -47,54 +48,42 @@ class ActionCache:
     attention_mask: torch.Tensor
 
 
-class ProprioEncoder(CheckpointModule, nn.Linear):
-    """One linear projection of the initial proprioceptive state.
+class ProprioEncoder(ModelMixin, ConfigMixin):
 
-    Kept as its own subclass (instead of a bare ``nn.Linear``) so it can carry
-    a ``from_pretrained`` like every other FastWAM submodel — the Diffusers
-    per-submodel loading convention.  It is stored under the bundle directory
-    ``proprio_encoder/``.
-    """
+    @register_to_config
+    def __init__(self, in_features: int, out_features: int, bias: bool = True):
+        super().__init__()
+        self.proj = nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        return self.proj(x)
 
 
-class FastWAM(CheckpointModule, nn.Module):
+class FastWAM(nn.Module):
+
+    use_gradient_checkpointing: bool = False
 
     def __init__(
         self,
         vae: WanVideoVAE,
-        tokenizer: HuggingfaceTokenizer,
+        tokenizer: WantTextEncoderTokenizer,
         text_encoder: WanTextEncoder,
+        proprio_encoder: ProprioEncoder,
         video_expert: VideoDiT,
         action_expert: ActionDiT,
         video_scheduler: FlowMatchingScheduler,
         action_scheduler: FlowMatchingScheduler,
-        proprio_dim: Optional[int] = None,
-        use_gradient_checkpointing: bool = False,
-        device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
-    ) -> None:
+    ):
         super().__init__()
 
         self.vae = vae
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
-        # The video/action experts live exclusively inside ``mot.mixtures`` so
-        # the state dict has a single registration path (``mot.mixtures.*``),
-        # matching the original FastWAM checkpoint naming.  ``video_expert`` /
-        # ``action_expert`` are read-only views for callers.
-        self.mot: FastWAMMoT = FastWAMMoT(
-            video_expert,
-            action_expert,
-            use_gradient_checkpointing=use_gradient_checkpointing,
-        )
-
-        self.proprio_encoder = ProprioEncoder(proprio_dim, text_encoder.dim) if proprio_dim else None
-
+        self.mot: FastWAMMoT = FastWAMMoT(video_expert, action_expert)
+        self.mot.use_gradient_checkpointing = self.use_gradient_checkpointing
+        self.proprio_encoder = proprio_encoder
         self.video_scheduler = video_scheduler
         self.action_scheduler = action_scheduler
-
-        if device is not None or dtype is not None:
-            self.to(device=device, dtype=dtype)
 
     @property
     def video_expert(self) -> VideoDiT:
@@ -104,13 +93,60 @@ class FastWAM(CheckpointModule, nn.Module):
     def action_expert(self) -> ActionDiT:
         return self.mot.mixtures["action"]
 
+    # --------- deprecated --------- #
     @property
     def current_device(self) -> torch.device:
         return next(self.mot.parameters()).device
 
+    # --------- deprecated --------- #
     @property
     def current_dtype(self) -> torch.dtype:
         return next(self.mot.parameters()).dtype
+
+    @classmethod
+    def from_pretrained(
+        cls: "FastWAM",
+        pretrained_model_name_or_path: str,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Self:
+        pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
+        vae = WanVideoVAE.from_pretrained(pretrained_model_name_or_path, subfolder="vae", dtype=dtype)
+        tokenizer = WantTextEncoderTokenizer.from_pretrained(pretrained_model_name_or_path / "tokenizer")
+        text_encoder = WanTextEncoder.from_pretrained(
+            pretrained_model_name_or_path, subfolder="text_encoder", dtype=dtype
+        )
+        proprio_encoder = ProprioEncoder.from_pretrained(
+            pretrained_model_name_or_path, subfolder="proprio_encoder", dtype=dtype
+        )
+        video_expert = VideoDiT.from_pretrained(pretrained_model_name_or_path, subfolder="video_expert", dtype=dtype)
+        action_expert = ActionDiT.from_pretrained(pretrained_model_name_or_path, subfolder="action_expert", dtype=dtype)
+        video_scheduler = FlowMatchingScheduler.from_pretrained(
+            pretrained_model_name_or_path, subfolder="video_scheduler"
+        )
+        action_scheduler = FlowMatchingScheduler.from_pretrained(
+            pretrained_model_name_or_path, subfolder="action_scheduler"
+        )
+        return cls(
+            vae=vae,
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            proprio_encoder=proprio_encoder,
+            video_expert=video_expert,
+            action_expert=action_expert,
+            video_scheduler=video_scheduler,
+            action_scheduler=action_scheduler,
+        )
+
+    def save_pretrained(self, save_dir: str):
+        save_dir = Path(save_dir)
+        self.vae.save_pretrained(save_dir / "vae")
+        self.text_encoder.save_pretrained(save_dir / "text_encoder")
+        self.proprio_encoder.save_pretrained(save_dir / "proprio_encoder")
+        self.video_expert.save_pretrained(save_dir / "video_expert")
+        self.action_expert.save_pretrained(save_dir / "action_expert")
+        self.tokenizer.save_pretrained(save_dir / "tokenizer")
+        self.video_scheduler.save_pretrained(save_dir / "video_scheduler")
+        self.action_scheduler.save_pretrained(save_dir / "action_scheduler")
 
     def build_shared_attn_mask(
         self,
@@ -129,15 +165,11 @@ class FastWAM(CheckpointModule, nn.Module):
         mask[video_seq_len:, :first_frame_len] = True
         return mask
 
-    def encode_prompts(self, prompts: list[str] | str, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        """Tokenize and encode prompts into cross-attention conditioning.
-
-        Deliberate masking policy: prompts are padded to ``seq_len`` (128) by
-        the tokenizer, but the *returned* attention mask is the real token
-        mask, so padded positions are excluded from cross-attention entirely.
-        This keeps the conditioning signal dense for the short LIBERO task
-        descriptions instead of diluting it over 128 mostly-empty slots.
+    def encode_prompts(self, prompts: list[str] | str) -> tuple[torch.Tensor, torch.Tensor]:
+        r"""
+        Tokenize and encode prompts into cross-attention conditioning.
         """
+        device = next(self.text_encoder.parameters()).device
         ids, mask = self.tokenizer(prompts, return_mask=True, add_special_tokens=True)
         ids: torch.Tensor = ids.to(device)
         mask: torch.Tensor = mask.to(device=device, dtype=torch.bool)
@@ -146,17 +178,13 @@ class FastWAM(CheckpointModule, nn.Module):
         prompt_embeds = prompt_embeds.masked_fill(~mask.unsqueeze(-1), 0)
         return prompt_embeds, mask
 
-    def encode_proprios(self, proprios: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    def encode_proprios(self, proprios: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = proprios.shape[0]
-        if self.proprio_encoder is None:
-            proprio_embeds = torch.empty(
-                (batch_size, 0, self.text_encoder.dim), device=device, dtype=self.current_dtype
-            )
-            proprio_embeds_mask = torch.empty((batch_size, 0), device=device, dtype=torch.bool)
-            return proprio_embeds, proprio_embeds_mask
+        device = next(self.proprio_encoder.parameters()).device
 
         initial_proprio = proprios[:, 0, :] if proprios.ndim == 3 else proprios
         initial_proprio = initial_proprio.to(device=device, dtype=self.current_dtype)
+
         proprio_embeds = self.proprio_encoder(initial_proprio.unsqueeze(1))
         proprio_embeds_mask = torch.ones((batch_size, 1), device=device, dtype=torch.bool)
         return proprio_embeds, proprio_embeds_mask
@@ -165,8 +193,8 @@ class FastWAM(CheckpointModule, nn.Module):
         return self.vae.encode(videos=videos.to(device=device, dtype=self.current_dtype), device=device)
 
     def encode_condition(self, prompts: list[str] | str, proprios: torch.Tensor) -> ConditionOutputs:
-        prompt_embeds, prompt_mask = self.encode_prompts(prompts, self.current_device)
-        proprio_embeds, proprio_mask = self.encode_proprios(proprios, self.current_device)
+        prompt_embeds, prompt_mask = self.encode_prompts(prompts)
+        proprio_embeds, proprio_mask = self.encode_proprios(proprios)
         return ConditionOutputs(
             embeds=torch.cat([prompt_embeds, proprio_embeds], dim=1),
             mask=torch.cat([prompt_mask, proprio_mask], dim=1),

@@ -3,12 +3,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.configuration_utils import ConfigMixin, register_to_config
 from pathlib import Path
 from torch.utils.checkpoint import checkpoint
 from dataclasses import dataclass
 from typing import Optional, Literal
-
-from models.utils import CheckpointModule
 
 
 @dataclass
@@ -293,8 +293,11 @@ class Head(nn.Module):
         return x
 
 
-class VideoDiT(CheckpointModule, nn.Module):
+class VideoDiT(ModelMixin, ConfigMixin):
 
+    use_gradient_checkpointing: bool = False
+
+    @register_to_config
     def __init__(
         self,
         in_dim: int,
@@ -308,7 +311,6 @@ class VideoDiT(CheckpointModule, nn.Module):
         num_blocks: int,
         out_dim: int,
         self_attn_mask_mode: Literal["bidirectional", "per_frame_causal", "first_frame_causal"],
-        use_gradient_checkpointing: bool = False,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -318,7 +320,6 @@ class VideoDiT(CheckpointModule, nn.Module):
         self.time_dim = time_dim
         self.hidden_dim = hidden_dim
         self.self_attn_mask_mode = self_attn_mask_mode
-        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         self.patch_embedding = nn.Conv3d(
             in_channels=in_dim,
@@ -524,8 +525,11 @@ class VideoDiT(CheckpointModule, nn.Module):
         return video_tokens
 
 
-class ActionDiT(CheckpointModule, nn.Module):
+class ActionDiT(ModelMixin, ConfigMixin):
 
+    use_gradient_checkpointing: bool = False
+
+    @register_to_config
     def __init__(
         self,
         action_dim: int,
@@ -536,7 +540,6 @@ class ActionDiT(CheckpointModule, nn.Module):
         time_dim: int,
         ffn_dim: int,
         num_blocks: int,
-        use_gradient_checkpointing: bool = False,
         eps: float = 1e-6,
     ) -> None:
         super().__init__()
@@ -545,7 +548,6 @@ class ActionDiT(CheckpointModule, nn.Module):
         self.hidden_dim = hidden_dim
         self.text_dim = text_dim
         self.time_dim = time_dim
-        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         self.action_encoder = nn.Linear(action_dim, hidden_dim)
         self.text_embedding = nn.Sequential(

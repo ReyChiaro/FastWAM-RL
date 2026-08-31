@@ -4,8 +4,8 @@ import torch.nn.functional as F
 
 from pathlib import Path
 from typing import Any, Literal, Optional
-
-from models.utils import CheckpointModule
+from diffusers.models.modeling_utils import ModelMixin
+from diffusers.configuration_utils import ConfigMixin, register_to_config
 
 VAE_MEAN = [
     -0.2289,
@@ -930,8 +930,9 @@ class VAEModel(nn.Module):
         return out
 
 
-class WanVideoVAE(CheckpointModule, nn.Module):
+class WanVideoVAE(ModelMixin, ConfigMixin):
 
+    @register_to_config
     def __init__(
         self,
         encode_dim: int = 160,

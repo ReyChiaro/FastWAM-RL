@@ -3,6 +3,8 @@ import math
 import torch
 
 from dataclasses import dataclass, field
+from diffusers.schedulers.scheduling_utils import SchedulerMixin
+from diffusers.configuration_utils import ConfigMixin, register_to_config
 
 
 @dataclass
@@ -14,23 +16,25 @@ class FlowTransition:
     std: torch.Tensor
 
 
-@dataclass(frozen=True)
-class FlowMatchingScheduler:
+class FlowMatchingScheduler(SchedulerMixin, ConfigMixin):
 
-    shift: float = 5.0
-    eps: float = 1e-6
-    num_training_steps: int = 1000
-    weight_min: float = math.exp(-0.5)
-    weight_norm: float = field(init=False)
+    @register_to_config
+    def __init__(
+        self,
+        num_training_steps: int = 1000,
+        shift: float = 5.0,
+        min_training_loss: float = math.exp(-0.5),
+        eps: float = 1e-6,
+    ):
+        self.num_training_steps = num_training_steps
+        self.shift = shift
+        self.min_training_loss = min_training_loss
+        self.eps = eps
 
-    def __post_init__(self) -> None:
-        # The training distribution is sampled by drawing u ~ Uniform(0, 1)
-        # and shifting u into sigma space.  Normalize on that same distribution
-        # instead of on the current (arbitrary-sized) training batch.
         u = torch.linspace(0, 1, 4097, dtype=torch.float64)
         sigma = self.shift_sigma(u)
-        weight = torch.exp(-2 * (sigma - 0.5).square()) - self.weight_min
-        object.__setattr__(self, "weight_norm", float(torch.trapezoid(weight, u).item()))
+        weight = torch.exp(-2 * (sigma - 0.5).square()) - self.min_training_loss
+        self.norm_training_weight = float(torch.trapezoid(weight, u).item())
 
     def shift_sigma(self, u: torch.Tensor) -> torch.Tensor:
         return self.shift * u / (1.0 + (self.shift - 1) * u)
@@ -62,8 +66,8 @@ class FlowMatchingScheduler:
 
     def training_weight(self, sigma: torch.Tensor) -> torch.Tensor:
         sigma = sigma.to(dtype=torch.float32)
-        weight = torch.exp(-2 * (sigma - 0.5) ** 2) - self.weight_min
-        return weight / (self.weight_norm + self.eps)
+        weight = torch.exp(-2 * (sigma - 0.5) ** 2) - self.min_training_loss
+        return weight / (self.norm_training_weight + self.eps)
 
     def step(self, xt: torch.Tensor, v: torch.Tensor, sigma: torch.Tensor, next_sigma: torch.Tensor) -> torch.Tensor:
         dtype = xt.dtype

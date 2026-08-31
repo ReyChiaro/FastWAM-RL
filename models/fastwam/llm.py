@@ -1,15 +1,17 @@
+import json
 import math
+import html
 import torch
+import string
 import torch.nn as nn
 import torch.nn.functional as F
 
 from pathlib import Path
 from transformers import AutoTokenizer
-import html
-import string
-from typing import Any, Literal, Sequence
-
-from models.utils import CheckpointModule
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+from transformers.modeling_utils import PreTrainedModel
+from transformers.configuration_utils import PreTrainedConfig
+from typing import Any, Literal, Sequence, Self
 
 try:
     import ftfy
@@ -242,42 +244,59 @@ def init_weights(module: nn.Module) -> None:
         nn.init.normal_(module.embedding.weight, std=(2 * module.num_buckets * module.num_heads) ** -0.5)
 
 
-class WanTextEncoder(CheckpointModule, torch.nn.Module):
+class WanTextEncoderConfig(PreTrainedConfig):
 
-    def __init__(
-        self,
-        vocab: int | nn.Embedding = 256384,
-        dim: int = 4096,
-        dim_attn: int = 4096,
-        dim_ffn: int = 10240,
-        num_heads: int = 64,
-        num_layers: int = 24,
-        num_buckets: int = 32,
-        shared_pos: bool = False,
-        dropout: float = 0.1,
-    ) -> None:
-        super(WanTextEncoder, self).__init__()
-        self.dim = dim
-        self.dim_attn = dim_attn
-        self.dim_ffn = dim_ffn
-        self.num_heads = num_heads
-        self.num_layers = num_layers
-        self.num_buckets = num_buckets
-        self.shared_pos = shared_pos
+    model_type = "wan_text_encoder"
+
+    vocab: int = 256384
+    dim: int = 4096
+    dim_attn: int = 4096
+    dim_ffn: int = 10240
+    num_heads: int = 64
+    num_layers: int = 24
+    num_buckets: int = 32
+    shared_pos: bool = False
+    dropout: float = 0.1
+
+
+class WanTextEncoder(PreTrainedModel):
+    config_class = WanTextEncoderConfig
+
+    def __init__(self, config: WanTextEncoderConfig) -> None:
+        super().__init__(config)
+
+        self.dim = config.dim
+        self.dim_attn = config.dim_attn
+        self.dim_ffn = config.dim_ffn
+        self.num_heads = config.num_heads
+        self.num_layers = config.num_layers
+        self.num_buckets = config.num_buckets
+        self.shared_pos = config.shared_pos
 
         # layers
-        self.token_embedding = vocab if isinstance(vocab, nn.Embedding) else nn.Embedding(vocab, dim)
-        self.pos_embedding = T5RelativeEmbedding(num_buckets, num_heads, bidirectional=True) if shared_pos else None
-        self.dropout = nn.Dropout(dropout)
+        self.token_embedding = nn.Embedding(config.vocab, config.dim)
+        self.pos_embedding = (
+            T5RelativeEmbedding(config.num_buckets, config.num_heads, bidirectional=True) if config.shared_pos else None
+        )
+        self.dropout = nn.Dropout(config.dropout)
         self.blocks = nn.ModuleList(
             [
-                T5SelfAttention(dim, dim_attn, dim_ffn, num_heads, num_buckets, shared_pos, dropout)
-                for _ in range(num_layers)
+                T5SelfAttention(
+                    config.dim,
+                    config.dim_attn,
+                    config.dim_ffn,
+                    config.num_heads,
+                    config.num_buckets,
+                    config.shared_pos,
+                    config.dropout,
+                )
+                for _ in range(config.num_layers)
             ]
         )
-        self.norm = T5LayerNorm(dim)
+        self.norm = T5LayerNorm(config.dim)
 
-        self.apply(init_weights)
+        # self.apply(init_weights)
+        self.post_init()
 
     def forward(self, ids: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         x = self.token_embedding(ids)
@@ -316,23 +335,42 @@ def canonicalize(text: str, keep_punctuation_exact_string: str | None = None) ->
     return text.strip()
 
 
-class HuggingfaceTokenizer(CheckpointModule):
+class WantTextEncoderTokenizer:
+    config_file = "wan_text_encoder_tokenizer_config.json"
 
     def __init__(
         self,
-        name: str,
+        pretrained_model_name_or_path: str,
         seq_len: int | None = None,
         clean: Literal["whitespace", "lower", "canonicalize"] | None = None,
         **kwargs: Any,
     ) -> None:
         assert clean in (None, "whitespace", "lower", "canonicalize")
-        self.name = name
+        self.pretrained_model_name_or_path = pretrained_model_name_or_path
         self.seq_len = seq_len
         self.clean = clean
 
         # init tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained(name, **kwargs)
+        self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
+            self.pretrained_model_name_or_path, **kwargs
+        )
         self.vocab_size = self.tokenizer.vocab_size
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs) -> Self:
+        r""""""
+        cfg_path = Path(pretrained_model_name_or_path) / cls.config_file
+        cfgs = json.loads(cfg_path.read_text())
+        return cls(
+            pretrained_model_name_or_path=pretrained_model_name_or_path,
+            seq_len=cfgs["seq_len"],
+            clean=cfgs["clean"],
+            **kwargs,
+        )
+
+    def save_pretrained(self, save_dir: str):
+        self.tokenizer.save_pretrained(save_dir)
+        (Path(save_dir) / self.config_file).write_text(json.dumps({"seq_len": self.seq_len, "clean": self.clean}))
 
     def __call__(
         self,

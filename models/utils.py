@@ -1,14 +1,8 @@
-import torch.nn as nn
+import json
+
+from pathlib import Path
+from typing import Any
 
 
-class CheckpointModule:
-    r"""
-    Handle checkpoints loading and saving.
-    """
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name_or_path: str,
-    ) -> nn.Module:
-        pass
+def read_json(path: Path) -> dict[str, Any]:
+    return 

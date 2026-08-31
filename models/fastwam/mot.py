@@ -35,13 +35,13 @@ class AttentionInputs:
 class FastWAMMoT(nn.Module):
 
     experts = ["video", "action"]
+    use_gradient_checkpointing: bool = False
 
     def __init__(
         self,
         video_dit: VideoDiT,
         action_dit: ActionDiT,
-        use_gradient_checkpointing: bool = False,
-    ) -> None:
+    ):
         """
         Args:
             video_dit and action_dit are derived from the same DiTBlocks with same num of layers.
@@ -49,8 +49,6 @@ class FastWAMMoT(nn.Module):
         super().__init__()
 
         self.mixtures = nn.ModuleDict({"video": video_dit, "action": action_dit})
-        self.use_gradient_checkpointing = use_gradient_checkpointing
-
         for name, expert in self.mixtures.items():
             logger.info(f"  Expert `{name}`: num_params={sum(p.numel() for p in expert.parameters()) / 1e9:.2f} B")
 

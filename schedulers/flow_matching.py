@@ -8,9 +8,11 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 
 
 @dataclass
-class FlowTransition:
+class FlowStates:
 
     sample: torch.Tensor
+    sigma: torch.Tensor
+    next_sigma: torch.Tensor
     log_prob: torch.Tensor
     mean: torch.Tensor
     std: torch.Tensor
@@ -86,7 +88,7 @@ class FlowMatchingScheduler(SchedulerMixin, ConfigMixin):
         noise_level: float,
         next_sample: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
-    ) -> FlowTransition:
+    ) -> FlowStates:
         """One reverse-SDE transition and its per-sample log probability."""
 
         dtype = sample.dtype
@@ -119,4 +121,11 @@ class FlowMatchingScheduler(SchedulerMixin, ConfigMixin):
         log_prob = log_prob - torch.log(std) - 0.5 * math.log(2 * math.pi)
         log_prob = log_prob.flatten(1).mean(dim=1)
 
-        return FlowTransition(sample=next_xt.to(dtype), log_prob=log_prob, mean=mean, std=std)
+        return FlowStates(
+            sample=next_xt.to(dtype),
+            sigma=sigma,
+            next_sigma=next_sigma,
+            log_prob=log_prob,
+            mean=mean,
+            std=std,
+        )

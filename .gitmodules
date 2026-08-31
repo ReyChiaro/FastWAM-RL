@@ -1,0 +1,6 @@
+[submodule "submodules/LIBERO-plus"]
+	path = submodules/LIBERO-plus
+	url = https://github.com/sylvestf/LIBERO-plus.git
+[submodule "submodules/LIBERO"]
+	path = submodules/LIBERO
+	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git

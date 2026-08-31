@@ -6,13 +6,13 @@ from pathlib import Path
 from dataclasses import dataclass
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from typing import Any, Optional, Self
+from typing import Optional, Self
 
 from models.fastwam.mot import FastWAMMoT, ExpertInputs
 from models.fastwam.dit import VideoDiT, ActionDiT
 from models.fastwam.vae import WanVideoVAE
 from models.fastwam.llm import WanTextEncoder, WantTextEncoderTokenizer
-from schedulers.flow_matching import FlowMatchingScheduler, FlowTransition
+from schedulers.flow_matching import FlowMatchingScheduler, FlowStates
 
 
 @dataclass
@@ -32,20 +32,6 @@ class ModelInputs:
     frame_is_pad: torch.Tensor
     action_is_pad: torch.Tensor
     first_frame_latents: torch.Tensor
-
-
-@dataclass
-class ConditionOutputs:
-
-    embeds: torch.Tensor
-    mask: torch.Tensor
-
-
-@dataclass
-class ActionCache:
-
-    key_values: list[dict[str, torch.Tensor]]
-    attention_mask: torch.Tensor
 
 
 class ProprioEncoder(ModelMixin, ConfigMixin):
@@ -92,16 +78,6 @@ class FastWAM(nn.Module):
     @property
     def action_expert(self) -> ActionDiT:
         return self.mot.mixtures["action"]
-
-    # --------- deprecated --------- #
-    @property
-    def current_device(self) -> torch.device:
-        return next(self.mot.parameters()).device
-
-    # --------- deprecated --------- #
-    @property
-    def current_dtype(self) -> torch.dtype:
-        return next(self.mot.parameters()).dtype
 
     @classmethod
     def from_pretrained(
@@ -183,42 +159,139 @@ class FastWAM(nn.Module):
         device = next(self.proprio_encoder.parameters()).device
 
         initial_proprio = proprios[:, 0, :] if proprios.ndim == 3 else proprios
-        initial_proprio = initial_proprio.to(device=device, dtype=self.current_dtype)
+        initial_proprio = initial_proprio.to(device=device, dtype=proprios.dtype)
 
         proprio_embeds = self.proprio_encoder(initial_proprio.unsqueeze(1))
         proprio_embeds_mask = torch.ones((batch_size, 1), device=device, dtype=torch.bool)
         return proprio_embeds, proprio_embeds_mask
 
     def encode_videos(self, videos: torch.Tensor, device: torch.device) -> torch.Tensor:
-        return self.vae.encode(videos=videos.to(device=device, dtype=self.current_dtype), device=device)
+        return self.vae.encode(videos=videos, device=device)
 
-    def encode_condition(self, prompts: list[str] | str, proprios: torch.Tensor) -> ConditionOutputs:
+    def prepare_inputs(self, sample: dict[str, list[str] | torch.Tensor]) -> ModelInputs:
+        """
+        Preprocess inputs, put to device and convert dtype.
+
+        prompt (str):
+        video: [B,3,T,H,W] The video size should be dividisible by 16 and the frames should be T=(F-1)*4+1
+        action: [B,T,C]
+        proprio_states: [B,C]
+        video_pad: [B,T]
+        action_pad: [B,T]
+        """
+        prompts: list[str] = sample["prompt"]
+        videos: torch.Tensor = sample["video"]
+        actions: torch.Tensor = sample["action"]
+        proprios: torch.Tensor = sample["proprio_states"]
+        video_pad: torch.Tensor = sample["video_pad"]
+        action_pad: torch.Tensor = sample["action_pad"]
+
+        device = next(self.text_encoder.parameters()).device
         prompt_embeds, prompt_mask = self.encode_prompts(prompts)
         proprio_embeds, proprio_mask = self.encode_proprios(proprios)
-        return ConditionOutputs(
-            embeds=torch.cat([prompt_embeds, proprio_embeds], dim=1),
-            mask=torch.cat([prompt_mask, proprio_mask], dim=1),
+        embeds = torch.cat([prompt_embeds, proprio_embeds], dim=1)
+        mask = torch.cat([prompt_mask, proprio_mask], dim=1)
+
+        video_latents = self.encode_videos(videos, device)
+        first_frame_latents = video_latents[:, :, 0:1]
+
+        # The prompt_embeds can be encoded text prompt or the concatenated text and state
+        return ModelInputs(
+            video_latents=video_latents,
+            action_latents=actions.to(device=device, dtype=video_latents.dtype),
+            prompt_embeds=embeds,
+            prompt_embeds_mask=mask,
+            first_frame_latents=first_frame_latents,
+            frame_is_pad=video_pad.to(device=device, dtype=torch.bool),
+            action_is_pad=action_pad.to(device=device, dtype=torch.bool),
         )
 
-    def predict_joint_velocity(
+    def prepare_video_cache(
+        self,
+        first_frame_latents: torch.Tensor,
+        action_horizon: int,
+        prompt_embeds: torch.Tensor,
+        prompt_embeds_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor]:
+        r"""
+        prompt_embeds: The encoded text prompts or the concatenated text and proprio states embeds.
+        """
+        zero_sigma = torch.zeros(first_frame_latents.shape[0], device=first_frame_latents.device)
+        video_info = self.video_expert.preprocess(
+            video_tokens=first_frame_latents,
+            timestep=self.video_scheduler.convert_to_model_timesteps(zero_sigma),
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+        )
+
+        video_length = video_info.hidden_states.shape[1]
+        attention_mask = self.build_shared_attn_mask(
+            video_seq_len=video_length,
+            action_seq_len=action_horizon,
+            video_tokens_per_frame=video_info.num_tokens_per_frame,
+            device=first_frame_latents.device,
+        )
+
+        key_values = self.mot.prefill_video_cache(
+            ExpertInputs(
+                hidden_states=video_info.hidden_states,
+                freqs=video_info.freqs,
+                prompt_embeds=video_info.prompt_embeds,
+                prompt_embeds_mask=video_info.prompt_embeds_mask,
+                time_embeds=video_info.time_projs,
+            ),
+            attention_mask[:video_length, :video_length],
+        )
+        return key_values, attention_mask
+
+    def predict_action(
+        self,
+        action_latents: torch.Tensor,
+        action_sigma: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        prompt_embeds_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        action_info = self.action_expert.preprocess(
+            action_tokens=action_latents,
+            timestep=self.action_scheduler.convert_to_model_timesteps(action_sigma),
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
+        )
+        hidden_states = self.mot.forward_with_video_cache(
+            ExpertInputs(
+                action_info.hidden_states,
+                action_info.freqs,
+                action_info.prompt_embeds,
+                action_info.prompt_embeds_mask,
+                action_info.time_projs,
+            ),
+            video_kv_cache=video_kv_cache,
+            attn_mask=attention_mask,
+        )
+        return self.action_expert.postprocess(hidden_states["action"])
+
+    def predict_video_action(
         self,
         video_latents: torch.Tensor,
         action_latents: torch.Tensor,
         video_sigma: torch.Tensor,
         action_sigma: torch.Tensor,
-        condition: ConditionOutputs,
+        prompt_embeds: torch.Tensor,
+        prompt_embeds_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         video_info = self.video_expert.preprocess(
             video_tokens=video_latents,
             timestep=self.video_scheduler.convert_to_model_timesteps(video_sigma),
-            prompt_embeds=condition.embeds,
-            prompt_embeds_mask=condition.mask,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
         )
         action_info = self.action_expert.preprocess(
             action_tokens=action_latents,
             timestep=self.action_scheduler.convert_to_model_timesteps(action_sigma),
-            prompt_embeds=condition.embeds,
-            prompt_embeds_mask=condition.mask,
+            prompt_embeds=prompt_embeds,
+            prompt_embeds_mask=prompt_embeds_mask,
         )
         attention_mask = self.build_shared_attn_mask(
             video_info.hidden_states.shape[1],
@@ -249,136 +322,13 @@ class FastWAM(nn.Module):
         action_velocity = self.action_expert.postprocess(hidden_states["action"])
         return video_velocity, action_velocity
 
-    def prepare_action_cache(
-        self,
-        first_frame_latents: torch.Tensor,
-        action_horizon: int,
-        condition: ConditionOutputs,
-    ) -> ActionCache:
-        zero_sigma = torch.zeros(first_frame_latents.shape[0], device=first_frame_latents.device)
-        video_info = self.video_expert.preprocess(
-            first_frame_latents,
-            self.video_scheduler.convert_to_model_timesteps(zero_sigma),
-            condition.embeds,
-            condition.mask,
-        )
-        video_length = video_info.hidden_states.shape[1]
-        attention_mask = self.build_shared_attn_mask(
-            video_length,
-            action_horizon,
-            video_info.num_tokens_per_frame,
-            first_frame_latents.device,
-        )
-        key_values = self.mot.prefill_video_cache(
-            ExpertInputs(
-                video_info.hidden_states,
-                video_info.freqs,
-                video_info.prompt_embeds,
-                video_info.prompt_embeds_mask,
-                video_info.time_projs,
-            ),
-            attention_mask[:video_length, :video_length],
-        )
-        return ActionCache(key_values, attention_mask)
-
-    def predict_action_velocity(
-        self,
-        action_latents: torch.Tensor,
-        action_sigma: torch.Tensor,
-        condition: ConditionOutputs,
-        cache: ActionCache,
-    ) -> torch.Tensor:
-        action_info = self.action_expert.preprocess(
-            action_latents,
-            self.action_scheduler.convert_to_model_timesteps(action_sigma),
-            condition.embeds,
-            condition.mask,
-        )
-        hidden_states = self.mot.forward_with_video_cache(
-            ExpertInputs(
-                action_info.hidden_states,
-                action_info.freqs,
-                action_info.prompt_embeds,
-                action_info.prompt_embeds_mask,
-                action_info.time_projs,
-            ),
-            cache.key_values,
-            cache.attention_mask,
-        )
-        return self.action_expert.postprocess(hidden_states["action"])
-
-    def action_transition(
-        self,
-        prompts: list[str],
-        first_frame: torch.Tensor,
-        proprio: torch.Tensor,
-        action: torch.Tensor,
-        sigma: torch.Tensor,
-        next_sigma: torch.Tensor,
-        noise_level: float,
-        next_action: torch.Tensor | None = None,
-        generator: torch.Generator | None = None,
-    ) -> FlowTransition:
-        """Differentiable action transition used by rollout replay and GRPO."""
-        device, dtype = self.current_device, self.current_dtype
-        first_frame = first_frame.to(device=device, dtype=dtype).unsqueeze(2)
-
-        first_frame_latents = self.encode_videos(first_frame, device)
-        condition = self.encode_condition(prompts, proprio)
-        cache = self.prepare_action_cache(first_frame_latents, action.shape[1], condition)
-
-        action = action.to(device=device, dtype=dtype)
-        sigma = sigma.to(device)
-        next_sigma = next_sigma.to(device)
-
-        velocity = self.predict_action_velocity(action, sigma, condition, cache)
-        return self.action_scheduler.stochastic_step(
-            action,
-            velocity,
-            sigma,
-            next_sigma,
-            noise_level,
-            next_sample=None if next_action is None else next_action.to(device=device, dtype=dtype),
-            generator=generator,
-        )
-
-    def prepare_inputs(self, sample: dict[str, list[str] | torch.Tensor]) -> ModelInputs:
-        """
-        video: [B,3,T,H,W] The video size should be dividisible by 16 and the frames should be T=(F-1)*4+1
-        frame_is_pad: [B,T]
-        action: [B,T,C]
-        action_is_pad: [B,T]
-        proprio: [B,C]
-        """
-        prompts: list[str] = sample["prompt"]
-        videos: torch.Tensor = sample["video"]
-        actions: torch.Tensor = sample["action"]
-        proprios: torch.Tensor = sample["proprio"]
-        frame_is_pad: torch.Tensor = sample["frame_is_pad"]
-        action_is_pad: torch.Tensor = sample["action_is_pad"]
-
-        device = self.current_device
-        condition = self.encode_condition(prompts, proprios)
-        video_latents = self.encode_videos(videos, device)
-        first_frame_latents = video_latents[:, :, 0:1]
-
-        return ModelInputs(
-            video_latents=video_latents,
-            action_latents=actions.to(device=device, dtype=self.current_dtype),
-            prompt_embeds=condition.embeds,
-            prompt_embeds_mask=condition.mask,
-            first_frame_latents=first_frame_latents,
-            frame_is_pad=frame_is_pad.to(device=device, dtype=torch.bool),
-            action_is_pad=action_is_pad.to(device=device, dtype=torch.bool),
-        )
-
     def compute_video_loss(
-        self, pred: torch.Tensor, gt: torch.Tensor, sigma: torch.Tensor, frame_is_pad: torch.Tensor
+        self, pred: torch.Tensor, gt: torch.Tensor, sigma: torch.Tensor, video_pad: torch.Tensor
     ) -> torch.Tensor:
         loss_field = F.mse_loss(pred.float(), gt.float(), reduction="none").mean(dim=(1, 3, 4))  # [B,C,T,H,W]->[B,T]
 
         temporal_factor = self.vae.temporal_downsample_factor
-        latent_is_pad = frame_is_pad[:, 1:].view(frame_is_pad.shape[0], -1, temporal_factor).all(dim=-1)
+        latent_is_pad = video_pad[:, 1:].view(video_pad.shape[0], -1, temporal_factor).all(dim=-1)
         valid_latents = ~latent_is_pad
         loss = (loss_field * valid_latents).sum(dim=-1) / valid_latents.sum(dim=-1).clamp(min=1.0)
 
@@ -386,17 +336,81 @@ class FastWAM(nn.Module):
         return (weight * loss).mean()
 
     def compute_action_loss(
-        self, pred: torch.Tensor, gt: torch.Tensor, sigma: torch.Tensor, action_is_pad: torch.Tensor
+        self, pred: torch.Tensor, gt: torch.Tensor, sigma: torch.Tensor, action_pad: torch.Tensor
     ) -> torch.Tensor:
         loss_field = F.mse_loss(pred.float(), gt.float(), reduction="none").mean(dim=-1)  # [B,T,C]->[B,T]
 
-        valid_latents = ~action_is_pad
+        valid_latents = ~action_pad
         loss = (loss_field * valid_latents).sum(dim=-1) / valid_latents.sum(dim=-1).clamp(min=1.0)
 
         weight = self.action_scheduler.training_weight(sigma)
         return (weight * loss).mean()
 
+    def stochastic_action_sampling_step(
+        self,
+        prompt_embeds: torch.Tensor,
+        first_frame: torch.Tensor,
+        proprio: torch.Tensor,
+        action: torch.Tensor,
+        sigma: torch.Tensor,
+        next_sigma: torch.Tensor,
+        noise_level: float,
+        prompt_embeds_mask: Optional[torch.Tensor] = None,
+        next_action: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+    ) -> FlowStates:
+        r"""
+        One step sampling with differentiable action transition used by rollout replay.
+
+        WARNING: This method return the predicted action via noised SDE based on the 
+            noise level. The generated action chunk contains `action_horizon` frames,
+            however, it will be replaned with some first frames rather than all frames.
+            So this method do not generate a complete spisode of a given task, it just
+            generate next action chunk based on the current observation.
+        """
+        device, dtype = action.device, action.dtype
+        first_frame = first_frame.to(device=device, dtype=dtype).unsqueeze(2)
+
+        first_frame_latents = self.encode_videos(first_frame, device)
+        proprio_embeds, proprio_embeds_mask = self.encode_proprios(proprio)
+
+        # Concat
+        cond_embeds = torch.cat([prompt_embeds, proprio_embeds], dim=1)
+        cond_embeds_mask = torch.cat([prompt_embeds_mask, proprio_embeds_mask], dim=1)
+
+        video_kv_cache, attention_mask = self.prepare_video_cache(
+            first_frame_latents=first_frame_latents,
+            action_horizon=action.shape[1],
+            prompt_embeds=cond_embeds,
+            prompt_embeds_mask=cond_embeds_mask,
+        )
+
+        action = action.to(device=device, dtype=dtype)
+        sigma = sigma.to(device)
+        next_sigma = next_sigma.to(device)
+
+        velocity = self.predict_action(
+            action_latents=action,
+            action_sigma=sigma,
+            prompt_embeds=cond_embeds,
+            prompt_embeds_mask=cond_embeds_mask,
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+        )
+        return self.action_scheduler.stochastic_step(
+            sample=action,
+            velocity=velocity,
+            sigma=sigma,
+            next_sigma=next_sigma,
+            noise_level=noise_level,
+            next_sample=None if next_action is None else next_action.to(device=device, dtype=dtype),
+            generator=generator,
+        )
+
     def training_step(self, sample: dict[str, str | torch.Tensor]) -> StepOutputs:
+        r"""
+        training_step will conduct supervised flow-matching training on both videos and actions.
+        """
         inputs = self.prepare_inputs(sample)
         device = inputs.video_latents.device
 
@@ -417,13 +431,13 @@ class FastWAM(nn.Module):
         action_xt = self.action_scheduler.add_noise(action_latents, action_noise, action_sigma)
         action_gt = self.action_scheduler.training_target(action_latents, action_noise)
 
-        condition = ConditionOutputs(inputs.prompt_embeds, inputs.prompt_embeds_mask)
-        pred_video, pred_action = self.predict_joint_velocity(
-            video_xt,
-            action_xt,
-            video_sigma,
-            action_sigma,
-            condition,
+        pred_video, pred_action = self.predict_video_action(
+            video_latents=video_xt,
+            action_latents=action_xt,
+            video_sigma=video_sigma,
+            action_sigma=action_sigma,
+            prompt_embeds=inputs.prompt_embeds,
+            prompt_embeds_mask=inputs.prompt_embeds_mask,
         )
         pred_video = pred_video[:, :, 1:]  # The first latent frame is ground truth.
 
@@ -433,14 +447,8 @@ class FastWAM(nn.Module):
 
         return StepOutputs(video_loss=video_loss, action_loss=action_loss)
 
-    def forward(
-        self,
-        sample: dict[str, str | torch.Tensor] | None = None,
-        operation: str = "sft",
-        **kwargs: Any,
-    ) -> StepOutputs | FlowTransition:
-        if operation == "sft":
-            return self.training_step(sample)
-        if operation == "action_transition":
-            return self.action_transition(**kwargs)
-        raise ValueError(f"Unsupported FastWAM operation {operation!r}.")
+    def forward(self, sample: dict[str, str | torch.Tensor]) -> StepOutputs:
+        r"""
+        A standard torch forward entrypoint for SFT training.
+        """
+        return self.training_step(sample)
